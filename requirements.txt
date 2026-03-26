@@ -1,0 +1,6 @@
+streamlit>=1.30.0
+opencv-python>=4.8.0
+dlib-bin>=19.24.0
+imutils>=0.5.4
+numpy>=1.24.0
+plotly>=5.18.0

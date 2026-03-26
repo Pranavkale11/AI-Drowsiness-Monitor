@@ -1,0 +1,4 @@
+timestamp,status,ear,fatigue,blinks
+02:32:11,Idle,0.3,0.0,0
+02:32:16,Active,0.3,0.0,0
+02:32:29,Idle,0.3,0.0,0
