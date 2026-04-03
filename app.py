@@ -45,9 +45,9 @@ if "run" not in st.session_state:
 if "blink_count" not in st.session_state:
     st.session_state.blink_count = 0
 if "ear_hist" not in st.session_state:
-    st.session_state.ear_hist = deque(maxlen=50)
+    st.session_state.ear_hist = deque(maxlen=100)  # Expanded for better graph history
 if "time_hist" not in st.session_state:
-    st.session_state.time_hist = deque(maxlen=50)
+    st.session_state.time_hist = deque(maxlen=100)
 if "start_time" not in st.session_state:
     st.session_state.start_time = None
 if "status" not in st.session_state:
@@ -158,12 +158,95 @@ class PerformanceTracker:
         except:
             return 0.0
 
-def play_alarm():
-    if WINSOUND_AVAILABLE:
-        try:
-            winsound.Beep(1000, 300)
-            winsound.Beep(1200, 300)
-        except: pass
+# ── Sound Alert System ───────────────────────────────────────────────────────
+# Uses @st.cache_resource so the engine object SURVIVES Streamlit script
+# reruns (which reset plain module-level globals and silently kill threads).
+
+class _AlertEngine:
+    """Thread-safe, non-blocking continuous sound alert engine.
+
+    Uses threading.Event for instant stop signalling so winsound.Beep()
+    never blocks the stop path (avoids the raw-bool + lock deadlock pattern).
+    """
+    def __init__(self):
+        # Event: set   → worker should keep playing
+        #        clear → worker should stop and exit
+        self._play_event = threading.Event()
+        self._mode_lock  = threading.Lock()   # Guards _mode string only
+        self._mode       = "sleeping"          # Current tone pattern
+        self._thread: threading.Thread | None = None
+        print("[AlertEngine] Initialised — winsound available:", WINSOUND_AVAILABLE)
+
+    # ------------------------------------------------------------------ #
+    def _worker(self):
+        """Background loop: plays loud 2000 Hz beep continuously while active."""
+        print("[Alarm] Worker started")
+        while self._play_event.is_set():
+            if not WINSOUND_AVAILABLE:
+                print("[Alarm] winsound unavailable — waiting")
+                self._play_event.wait(timeout=0.5)
+                continue
+            try:
+                winsound.Beep(2000, 400)   # 2000 Hz, 400 ms — loud & piercing
+                if not self._play_event.is_set():
+                    break
+                time.sleep(0.1)            # 100 ms gap between bursts
+            except Exception as exc:
+                print(f"[Alarm] Beep error: {exc}")
+                time.sleep(0.3)
+        print("[Alarm] Worker stopped")
+
+    # ------------------------------------------------------------------ #
+
+    def start(self, mode: str):
+        """Activate alert in the given mode ('drowsy' or 'sleeping').
+
+        Safe to call on every frame — only spawns a new thread when needed.
+        Mode switches are handled live inside the running worker.
+        """
+        with self._mode_lock:
+            self._mode = mode
+
+        if self._play_event.is_set():
+            # Worker already running — mode update above is enough
+            print(f"[AlertEngine] Mode updated to '{mode}' (thread already live)")
+            return
+
+        # Start a fresh worker thread
+        self._play_event.set()
+        print(f"[AlertEngine] Starting alert thread — mode: {mode}")
+
+        # Wait for previous thread to finish (should be instant after clear)
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+
+        self._thread = threading.Thread(
+            target=self._worker, name="AlertWorker", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self):
+        """Stop the alert immediately. Safe to call when nothing is playing."""
+        if self._play_event.is_set():
+            print("[AlertEngine] Stopping alert")
+            self._play_event.clear()    # Worker exits after current Beep finishes
+
+    def is_playing(self):
+        """Returns True if the alert is currently active."""
+        return self._play_event.is_set()
+
+
+@st.cache_resource(show_spinner=False)
+def _get_alarm() -> _AlertEngine:
+    """Singleton engine — persists across Streamlit reruns."""
+    return _AlertEngine()
+
+# Public API — no mode arg; single loud 2000 Hz alarm only
+def start_alert():
+    _get_alarm().start("sleeping")   # mode arg kept for engine compat
+
+def stop_alert():
+    _get_alarm().stop()
 
 @st.cache_resource(show_spinner=False)
 def load_models():
@@ -203,13 +286,41 @@ with st.sidebar:
     
     st.markdown("#### 👁️ Sensitivity")
     ear_threshold = st.slider("EAR Threshold", 0.15, 0.35, 0.25, 0.01)
-    consec_frames = st.slider("Trigger Buffer", 3, 20, 8)
+    consec_frames = st.slider("Trigger Buffer (frames)", 3, 20, 5)  # Lower default = faster trigger
     
     st.markdown("#### 🎨 UI Options")
     draw_landmarks = st.toggle("Show Landmarks", value=False)
     draw_box = st.toggle("Show Box", value=True)
     live_graph_active = st.toggle("Live Analytics", value=True)
-    
+
+    st.markdown("#### 🔔 Alert Settings")
+    alarm_enabled = st.toggle(
+        "Enable Alarm",
+        value=True,
+        help="Play audio tones when drowsiness or sleeping is detected (Windows only)"
+    )
+    if alarm_enabled and not WINSOUND_AVAILABLE:
+        st.warning("winsound not available on this platform — alarm disabled.", icon="🔇")
+
+    # One-click sound test — bypasses all detection logic
+    if st.button("🔊 Test Alarm Sound", help="Plays 3 beeps immediately to verify your audio is working"):
+        if WINSOUND_AVAILABLE:
+            def _test_beep():
+                import winsound as _ws, time as _t
+                _ws.Beep(2000, 300)
+                _t.sleep(0.1)
+                _ws.Beep(2000, 300)
+                _t.sleep(0.1)
+                _ws.Beep(2000, 300)
+            threading.Thread(target=_test_beep, daemon=True).start()
+            st.toast("🔊 Beep sent! Did you hear it?", icon="✅")
+        else:
+            st.error("winsound is not available on this system.")
+
+    # Live debug counters — visible while monitoring is active
+    st.markdown("#### 🛠️ Live Debug")
+    debug_placeholder = st.empty()
+
     st.markdown("---")
     st.caption("v3.1 Stable Release | OpenCV + dlib")
 
@@ -309,24 +420,39 @@ if st.session_state.run:
                         st.session_state.blink_count += 1
                     was_closed = is_closed
                     
+                    # ── Counter logic ─────────────────────────────────────
+                    # IMPORTANT: drowsy is NOT the opposite of sleeping.
+                    # When eyes are closed (is_closed), ONLY sleep_ctr grows.
+                    # When eyes are in the partial-close band, ONLY drowsy_ctr grows.
+                    # Neither branch resets the other's counter prematurely.
                     if is_closed:
                         sleep_ctr += 1
-                        drowsy_ctr = 0
+                        # Do NOT touch drowsy_ctr here — let it hold its value
                     elif cur_ear < ear_threshold + 0.04:
                         drowsy_ctr += 1
-                        sleep_ctr = 0
+                        # Do NOT reset sleep_ctr here — driver may re-close eyes next frame
                     else:
+                        # Eyes clearly open — reset both counters and stop alert
                         sleep_ctr = 0
                         drowsy_ctr = 0
                     
-                    # Update status
+                    # ── Update status & drive alarm ──────────────────────────
                     if sleep_ctr > consec_frames:
+                        # Eyes closed long enough — SLEEPING
                         st.session_state.status = "Sleeping"
-                        threading.Thread(target=play_alarm, daemon=True).start()
+                        print(f"[ALARM] Sleeping — sleep_ctr={sleep_ctr}")
+                        if alarm_enabled:
+                            start_alert()   # Loud continuous 2000 Hz alarm
+                        else:
+                            stop_alert()
                     elif drowsy_ctr > consec_frames:
+                        # Eyes partially closed — DROWSY (no alarm, just visual)
                         st.session_state.status = "Drowsy"
+                        stop_alert()        # No sound for drowsy state
                     else:
+                        # Eyes open — ACTIVE
                         st.session_state.status = "Active"
+                        stop_alert()        # Silence alarm immediately
                         
                     st.session_state.ear_hist.append(cur_ear)
                     st.session_state.time_hist.append(time.time() - st.session_state.start_time)
@@ -341,6 +467,25 @@ if st.session_state.run:
                     st.session_state.status = "No Face"
                     sleep_ctr = 0
                     drowsy_ctr = 0
+                    stop_alert()  # No face detected — stop alarm
+
+            # ── Live debug counter update in sidebar ──────────────────────
+            # Safe read: ear_hist may be empty on startup frames before any
+            # face has been detected, so always guard with a fallback.
+            _ear_display = f"{st.session_state.ear_hist[-1]:.3f}" if st.session_state.ear_hist else "--"
+            alarm = _get_alarm()
+            alert_state = "🔴 PLAYING" if alarm.is_playing() else "⚫ OFF"
+            debug_placeholder.markdown(
+                f"""
+                | Counter | Value |
+                |---|---|
+                | `sleep_ctr` | **{sleep_ctr}** / {consec_frames} |
+                | `drowsy_ctr` | **{drowsy_ctr}** / {consec_frames} |
+                | `EAR` | **{_ear_display}** |
+                | `Alarm` | {alert_state} |
+                """,
+                unsafe_allow_html=False
+            )
 
             # UI Update Throttling (~15 FPS)
             if time.time() - last_ui > 0.06:
@@ -359,7 +504,7 @@ if st.session_state.run:
                 time_placeholder.markdown(f"<div class='metric-label'>Elapsed Time</div><div class='metric-value' style='font-size:1rem;'>{elap//60:02d}:{elap%60:02d}s</div>", unsafe_allow_html=True)
                 
                 # Fatigue
-                ear_now = st.session_state.ear_hist[-1] if st.session_state.ear_hist else 0.3
+                ear_now = st.session_state.ear_hist[-1] if st.session_state.ear_hist else 0.0
                 fatigue = min(100, max(0, (ear_threshold-ear_now)/ear_threshold*40 + (sleep_ctr*5)))
                 f_color = "#ef4444" if fatigue > 70 else ("#fbbf24" if fatigue > 35 else "#10b981")
                 fatigue_placeholder.markdown(f"""
