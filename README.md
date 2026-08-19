@@ -127,5 +127,3 @@ If you found this project useful, consider:
 - **🤝 Contribute** by submitting a pull request!
 
 ---
-</canvaentity
->
