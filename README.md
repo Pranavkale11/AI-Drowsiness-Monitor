@@ -1,4 +1,4 @@
-# 🚗 AI-Based Driver Drowsiness & Alert Monitoring System
+# 🚗 Driver Drowsiness & Alert Monitoring System
 
 A real-time computer vision system designed to detect driver drowsiness and fatigue using facial landmark detection and intelligent monitoring techniques.
 
