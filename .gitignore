@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDEs and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime outputs
+*.csv
+logs/
+
+# Large local assets
+*.tar.gz
+*.bz2
+*.dat
+
+# Streamlit
+.streamlit/secrets.toml
+
+# ── SOS / Secrets ────────────────────────────────────────────
+# NEVER commit .env — it contains Twilio credentials.
+.env
+.env.*
+# Allow the safe placeholder template to be committed
+!.env.example
+
+# Emergency contact file may contain personal phone numbers
+emergency_contact.json

@@ -13,7 +13,12 @@ cap = cv2.VideoCapture(0)
 
 #Initializing the face detector and landmark detector
 detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+try:
+	predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+except Exception as exc:
+	print(f"Failed to load shape predictor: {exc}")
+	cap.release()
+	raise SystemExit(1)
 
 #status marking for current state
 sleep = 0
@@ -41,7 +46,12 @@ def blinked(a,b,c,d,e,f):
 
 
 while True:
-    _, frame = cap.read()
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print("Camera read failed. Exiting safely.")
+        break
+
+    face_frame = frame.copy()
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
     faces = detector(gray)
@@ -52,7 +62,6 @@ while True:
         x2 = face.right()
         y2 = face.bottom()
 
-        face_frame = frame.copy()
         cv2.rectangle(face_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         landmarks = predictor(gray, face)
@@ -100,3 +109,6 @@ while True:
     key = cv2.waitKey(1)
     if key == 27:
       	break
+
+cap.release()
+cv2.destroyAllWindows()

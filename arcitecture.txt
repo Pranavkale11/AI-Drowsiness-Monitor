@@ -1,0 +1,20 @@
+        👁️ Camera
+           ↓
+   AI Drowsiness Detection
+           ↓
+    Driver Sleeping / 
+   Severe Drowsiness
+           ↓
+      10 sec countdown
+           ↓
+     Driver responds?
+       ↙          ↘
+     YES           NO
+      ↓             ↓
+   Cancel       🚨 SOS TRIGGER
+                    │
+             ┌──────┴──────┐
+             ↓             ↓
+        📱 SMS          📞 CALL
+             ↓             ↓
+        Emergency Contact

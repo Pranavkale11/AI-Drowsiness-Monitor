@@ -1,0 +1,5 @@
+Abhi bas ye 3 commands ek-ek karke chalao:
+
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install -r requirements.txt
