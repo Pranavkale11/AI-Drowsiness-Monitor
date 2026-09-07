@@ -7,3 +7,4 @@ plotly>=5.18.0
 geocoder>=1.38.1
 twilio>=9.0.0
 python-dotenv>=1.0.0
+streamlit-webrtc>=0.47.0

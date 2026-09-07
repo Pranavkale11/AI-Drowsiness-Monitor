@@ -17,6 +17,19 @@ import json
 from imutils import face_utils
 from collections import deque
 from pathlib import Path
+import queue as _queue_module
+
+# ── streamlit-webrtc (browser webcam — replaces server-side cv2.VideoCapture) ──
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+    import av
+    WEBRTC_AVAILABLE = True
+    _RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+except ImportError:
+    WEBRTC_AVAILABLE = False
+    _RTC_CONFIGURATION = None
 
 # ── Dependency Check ──────────────────────────────────────────────────────────
 try:
@@ -25,17 +38,6 @@ try:
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-try:
-    import pygame
-    PYGAME_AVAILABLE = True
-except ImportError:
-    PYGAME_AVAILABLE = False
-
-try:
-    from playsound import playsound
-    PLAYSOUND_AVAILABLE = True
-except ImportError:
-    PLAYSOUND_AVAILABLE = False
 
 try:
     import geocoder
@@ -1021,7 +1023,9 @@ def make_sos_call(trigger_source: str = "manual") -> bool:
 def _get_sos_manager() -> "SosManager":
     """Singleton SOS state machine — persists across all Streamlit reruns."""
     if SOS_MODULE_AVAILABLE:
-        return SosManager()
+        sm = SosManager()
+        sm.countdown_seconds = 0
+        return sm
     # Stub when sos module failed to import (prevents crashes)
     class _StubSosManager:
         state = "IDLE"
@@ -1132,126 +1136,40 @@ def _sos_get_state() -> str:
     return _get_sos_manager().state
 
 
-class _AlertEngine:
-    """Thread-safe background alarm player for the sleeping state."""
+import base64
 
+@st.cache_data(show_spinner=False)
+def _get_alarm_base64() -> str:
+    """Load the MP3 file into a base64 string for HTML5 audio."""
+    if not os.path.exists(ALARM_SOUND_PATH):
+        return ""
+    try:
+        with open(ALARM_SOUND_PATH, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    except Exception:
+        return ""
 
-    def __init__(self, sound_path: str):
-        self.sound_path = sound_path
-        self._play_event = threading.Event()
-        self._lock = threading.Lock()
-        self._thread: threading.Thread | None = None
-        self.alarm_on = False
-        self.backend = "pygame" if PYGAME_AVAILABLE else ("playsound" if PLAYSOUND_AVAILABLE else "none")
-        print(
-            "[AlertEngine] Initialised | "
-            f"backend={self.backend} | "
-            f"pygame={PYGAME_AVAILABLE} | playsound={PLAYSOUND_AVAILABLE}"
-        )
-
-    def _worker(self):
-        """Play the alarm without blocking the video-processing loop."""
-        print(f"[Alarm] Worker started | backend={self.backend} | path={self.sound_path}")
-
-        try:
-            if not os.path.exists(self.sound_path):
-                print(f"[Alarm] Sound file not found: {self.sound_path}")
-                return
-
-            if self.backend == "pygame":
-                if not pygame.mixer.get_init():
-                    pygame.mixer.init()
-                    print("[Alarm] pygame.mixer initialized")
-
-                pygame.mixer.music.load(self.sound_path)
-                pygame.mixer.music.play(-1)
-                print("[Alarm] pygame playback started")
-
-                while self._play_event.is_set():
-                    time.sleep(0.1)
-
-                pygame.mixer.music.stop()
-                print("[Alarm] pygame playback stopped")
-                return
-
-            if self.backend == "playsound":
-                print("[Alarm] Falling back to playsound backend")
-                while self._play_event.is_set():
-                    print("[Alarm] Playing alarm sound via playsound")
-                    playsound(self.sound_path, block=True)
-                    time.sleep(0.05)
-                return
-
-            print("[Alarm] No audio backend available")
-        except Exception as exc:
-            print(f"[Alarm] Playback error: {exc}")
-        finally:
-            if PYGAME_AVAILABLE and pygame.mixer.get_init():
-                try:
-                    pygame.mixer.music.stop()
-                except Exception:
-                    pass
-
-            with self._lock:
-                self.alarm_on = False
-                self._play_event.clear()
-            print("[Alarm] Worker stopped")
-
-    def start(self):
-        """Trigger the alarm once and ignore repeated per-frame calls."""
-        with self._lock:
-            if self.alarm_on:
-                print("[AlertEngine] start() ignored - alarm already on")
-                return
-
-            self.alarm_on = True
-            self._play_event.set()
-            print("[AlertEngine] Alarm enabled")
-
-            if self._thread is not None and self._thread.is_alive():
-                print("[AlertEngine] Worker already alive")
-                return
-
-            self._thread = threading.Thread(
-                target=self._worker,
-                name="AlarmWorker",
-                daemon=True,
-            )
-            self._thread.start()
-
-    def stop(self):
-        """Stop playback when the eyes are open again."""
-        with self._lock:
-            if self.alarm_on:
-                print("[AlertEngine] Alarm disabled")
-            self.alarm_on = False
-            self._play_event.clear()
-
-        if PYGAME_AVAILABLE and pygame.mixer.get_init():
-            try:
-                pygame.mixer.music.stop()
-                print("[AlertEngine] pygame stop() issued")
-            except Exception as exc:
-                print(f"[AlertEngine] pygame stop failed: {exc}")
-
-    def is_playing(self):
-        """Returns True if the sleep alarm is currently active."""
-        return self.alarm_on
-
-
-@st.cache_resource(show_spinner=False)
-def _get_alarm() -> _AlertEngine:
-    """Singleton engine — persists across Streamlit reruns."""
-    return _AlertEngine(ALARM_SOUND_PATH)
-
-# Public API — no mode arg; single loud 2000 Hz alarm only
 def start_alert():
-    print("[AlertAPI] start_alert() called")
-    _get_alarm().start()
+    """Trigger the browser-based alarm."""
+    if not st.session_state.get("alarm_active", False):
+        print("[AlertAPI] start_alert() called")
+        st.session_state.alarm_active = True
 
 def stop_alert():
-    print("[AlertAPI] stop_alert() called")
-    _get_alarm().stop()
+    """Stop the browser-based alarm."""
+    if st.session_state.get("alarm_active", False):
+        print("[AlertAPI] stop_alert() called")
+        st.session_state.alarm_active = False
+
+def render_browser_alarm():
+    """Injects an invisible HTML5 audio element into the DOM if the alarm is active."""
+    if st.session_state.get("alarm_active", False):
+        b64 = _get_alarm_base64()
+        if b64:
+            st.markdown(
+                f'<audio autoplay loop style="display:none;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>',
+                unsafe_allow_html=True,
+            )
 
 @st.cache_resource(show_spinner=False)
 def load_models():
@@ -1264,6 +1182,132 @@ def load_models():
         return None, None
 
 DETECTOR, PREDICTOR = load_models()
+
+# ── EAR calculation (moved to module-level so DrowsinessTransformer can use it) ─
+def eye_ear(pts):
+    A = np.linalg.norm(pts[1] - pts[5])
+    B = np.linalg.norm(pts[2] - pts[4])
+    C = np.linalg.norm(pts[0] - pts[3])
+    if C == 0:
+        return 0.0
+    return (A + B) / (2.0 * C)
+
+
+def _make_proc_state():
+    """Return a fresh detection-state dict for a new monitoring session."""
+    return {
+        "f_idx": 0,
+        "closed_counter": 0,
+        "closure_start_time": 0.0,
+        "last_sleep_detected_at": 0.0,
+        "was_closed": False,
+        "perf": PerformanceTracker(),
+    }
+
+
+# ── Browser-webcam frame processor (replaces ThreadedCamera + while-loop) ──────
+# Receives frames from the user's browser webcam via streamlit-webrtc,
+# runs the existing dlib detection pipeline, annotates frames, and places
+# results in a thread-safe queue for the Streamlit main thread to consume.
+if WEBRTC_AVAILABLE:
+    class DrowsinessTransformer(VideoProcessorBase):
+        """VideoProcessor that runs the dlib drowsiness pipeline on browser frames."""
+
+        def __init__(self):
+            self.result_queue: _queue_module.Queue = _queue_module.Queue(maxsize=4)
+            # Mirrored from sidebar settings — written by main thread, read by recv()
+            self.draw_box: bool = True
+            self.draw_landmarks: bool = False
+            self.ear_threshold: float = 0.25
+            self.frame_skip: int = 2
+            self._f_idx: int = 0
+            # Last valid detection (for per-frame annotation between detections)
+            self._last_rect = None
+            self._last_shape = None
+            self._last_is_closed: bool = False
+            self._last_face_detected: bool = False
+
+        def recv(self, frame: "av.VideoFrame") -> "av.VideoFrame":
+            # to_ndarray(format="bgr24") → OpenCV-compatible BGR numpy array
+            img = frame.to_ndarray(format="bgr24")
+            self._f_idx += 1
+
+            # Run dlib detection only every frame_skip frames (same as original)
+            if self._f_idx % max(1, self.frame_skip) == 0:
+                small = cv2.resize(img, (320, 240))
+                gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+                result = {"face_detected": False, "timestamp": time.time()}
+
+                if DETECTOR is not None and PREDICTOR is not None:
+                    faces = DETECTOR(gray_small, 0)
+
+                    if faces:
+                        face = faces[0]
+                        # Scale landmark rect back to full-resolution coordinates
+                        r = dlib.rectangle(
+                            face.left() * 2, face.top() * 2,
+                            face.right() * 2, face.bottom() * 2,
+                        )
+                        gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        shape = PREDICTOR(gray_full, r)
+                        shape = face_utils.shape_to_np(shape)
+
+                        left_eye = shape[36:42]
+                        right_eye = shape[42:48]
+                        cur_ear = (eye_ear(left_eye) + eye_ear(right_eye)) / 2.0
+                        is_closed = cur_ear < self.ear_threshold
+
+                        # Cache for annotation on frames between detections
+                        self._last_rect = r
+                        self._last_shape = shape
+                        self._last_is_closed = is_closed
+                        self._last_face_detected = True
+
+                        result.update({
+                            "face_detected": True,
+                            "ear": cur_ear,
+                            "is_closed": is_closed,
+                        })
+                    else:
+                        self._last_face_detected = False
+                        self._last_rect = None
+
+                # Non-blocking enqueue — drop oldest entry if queue is full
+                try:
+                    self.result_queue.put_nowait(result)
+                except _queue_module.Full:
+                    try:
+                        self.result_queue.get_nowait()
+                    except _queue_module.Empty:
+                        pass
+                    try:
+                        self.result_queue.put_nowait(result)
+                    except _queue_module.Full:
+                        pass
+
+            # Draw annotations every frame using last valid detection result
+            if self._last_face_detected and self._last_rect is not None:
+                if self.draw_box:
+                    color = (0, 0, 255) if self._last_is_closed else (16, 185, 129)
+                    r = self._last_rect
+                    cv2.rectangle(
+                        img,
+                        (r.left(), r.top()),
+                        (r.right(), r.bottom()),
+                        color,
+                        2,
+                    )
+                if self.draw_landmarks and self._last_shape is not None:
+                    for (x, y) in self._last_shape:
+                        cv2.circle(img, (x, y), 1, (255, 255, 255), -1)
+
+            # Return annotated BGR frame — streamlit-webrtc streams it to the browser
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+else:
+    DrowsinessTransformer = None  # type: ignore[assignment,misc]
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  SIDEBAR COMMANDS
@@ -1293,6 +1337,9 @@ with st.sidebar:
             st.session_state.sos_triggered = False
             st.session_state.ear_hist.clear()
             st.session_state.time_hist.clear()
+            st.session_state.proc_state = _make_proc_state()  # fresh detection counters
+        else:
+            st.session_state.proc_state = None  # release state when monitoring stops
         st.rerun()
 
     st.markdown("---")
@@ -1488,37 +1535,27 @@ with st.sidebar:
         value=True,
         help="Play the alarm.mp3 file only when the driver enters the sleeping state"
     )
-    if alarm_enabled and not PYGAME_AVAILABLE and not PLAYSOUND_AVAILABLE:
-        st.warning("No audio backend is installed. Install dependencies to enable audio alerts.", icon="⚠️")
-    elif alarm_enabled and not os.path.exists(ALARM_SOUND_PATH):
+    if alarm_enabled and not os.path.exists(ALARM_SOUND_PATH):
         st.warning(f"Alarm file not found at {ALARM_SOUND_PATH}.", icon="⚠️")
     else:
         st.caption(f"Alarm file: {ALARM_SOUND_PATH}")
-        st.caption(
-            "Audio backend: "
-            + ("pygame" if PYGAME_AVAILABLE else ("playsound" if PLAYSOUND_AVAILABLE else "none"))
-        )
+        st.caption("Audio backend: HTML5 Browser Audio")
 
     # One-click sound test bypasses detection logic
     if st.button("🔊 Test Alarm Sound", help="Play the configured alarm.mp3 file once"):
-        if not PYGAME_AVAILABLE and not PLAYSOUND_AVAILABLE:
-            st.error("No audio backend is installed.", icon="❌")
-        elif not os.path.exists(ALARM_SOUND_PATH):
+        if not os.path.exists(ALARM_SOUND_PATH):
             st.error(f"Alarm file not found at {ALARM_SOUND_PATH}.", icon="❌")
         else:
             print(f"[AlarmTest] Testing alarm file: {ALARM_SOUND_PATH}")
             start_alert()
             st.toast("🔊 Alarm sound started.", icon="🔊")
 
-    if st.button("🔊 Force Sleep Alarm", help="Force the alarm on to test the runtime path"):
-        print("[AlarmTest] Force Sleep Alarm button pressed")
-        start_alert()
-        st.toast("🔊 Forced alarm trigger sent.", icon="🔊")
-
-    if st.button("❌ Stop Alarm Test", help="Manually stop the alarm test"):
+    if st.button("🔇 Stop Alarm Test", help="Stop the currently playing alarm"):
         print("[AlarmTest] Stop Alarm Test button pressed")
         stop_alert()
-        st.toast("❌ Alarm stop sent.", icon="❌")
+        st.toast("🔇 Alarm sound stopped.", icon="🔇")
+
+
 
     # Live debug counters — visible while monitoring is active
     st.markdown("#### 🛠️ Live Debug")
@@ -1568,7 +1605,37 @@ with col_v:
         """,
         unsafe_allow_html=True,
     )
-    video_placeholder = st.empty()
+    # ── Browser webcam via streamlit-webrtc ─────────────────────────────────
+    # Replaces: cv2.VideoCapture(0) / ThreadedCamera
+    # The browser requests camera permission; frames are streamed to the server
+    # via WebRTC and processed by DrowsinessTransformer.recv().
+    if (
+        st.session_state.run
+        and WEBRTC_AVAILABLE
+        and DETECTOR is not None
+        and PREDICTOR is not None
+    ):
+        ctx = webrtc_streamer(
+            key="drowsiness-monitor",
+            video_processor_factory=DrowsinessTransformer,
+            rtc_configuration=_RTC_CONFIGURATION,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
+        st.caption(
+            "📷 Click **START** above to grant camera permission and begin monitoring. "
+            "Your webcam runs in the browser — no camera access on the server."
+        )
+    elif st.session_state.run and not WEBRTC_AVAILABLE:
+        ctx = None
+        st.error(
+            "streamlit-webrtc is not installed. "
+            "Add `streamlit-webrtc>=0.47.0` to requirements.txt and redeploy.",
+            icon="❌",
+        )
+    else:
+        ctx = None
+    video_placeholder = st.empty()  # Standby UI shown when not monitoring
     st.markdown("</div>", unsafe_allow_html=True)
     alert_placeholder = st.empty()
 with col_a:
@@ -1627,354 +1694,344 @@ with col_a:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  STABLE EXECUTION LOOP
+#  WEBRTC PROCESSING LOOP  (replaces ThreadedCamera + while-loop)
+#
+#  Architecture:
+#    DrowsinessTransformer.recv()  ← background thread (streamlit-webrtc)
+#        ↓ result dict via queue
+#    Main thread (each st.rerun)   → drowsiness state → SOS/alarm → UI update
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if st.session_state.run and DETECTOR is not None and PREDICTOR is not None:
-    # Use context manager for safe camera handling
-    with ThreadedCamera(src=0, width=640, height=480) as cam:
-        perf = PerformanceTracker()
-        f_idx = 0
-        was_closed = False
-        closed_counter = 0
-        closure_start_time = 0.0
-        last_sleep_detected_at = 0.0
-        last_ui = 0
-        last_graph = 0
-        
-        while st.session_state.run:
-            ret, frame = cam.read()
-            if not ret or frame is None:
-                st.error("Camera connection failed.", icon="❌")
-                st.session_state.run = False
-                stop_alert()
+
+    # ── Ensure proc_state exists (safety net for unexpected reruns) ───────
+    if st.session_state.get("proc_state") is None:
+        st.session_state.proc_state = _make_proc_state()
+    ps = st.session_state.proc_state
+
+    # ── Propagate sidebar settings into the transformer (GIL-safe writes) ─
+    if ctx is not None and ctx.video_processor is not None:
+        ctx.video_processor.draw_box = draw_box
+        ctx.video_processor.draw_landmarks = draw_landmarks
+        ctx.video_processor.ear_threshold = ear_threshold
+        ctx.video_processor.frame_skip = FRAME_SKIP
+
+    # ── Drain result queue — keep only the latest result ─────────────────
+    result = None
+    if ctx is not None and ctx.video_processor is not None:
+        latest = None
+        while True:
+            try:
+                latest = ctx.video_processor.result_queue.get_nowait()
+            except _queue_module.Empty:
                 break
-            
-            perf.tick()
-            f_idx += 1
-            
-            # Logic Processing
-            if f_idx % FRAME_SKIP == 0:
-                # Optimized sub-sampling
-                small = cv2.resize(frame, (320, 240))
-                gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                faces = DETECTOR(gray_small, 0)
-                
-                if faces:
-                    face = faces[0]
-                    # Scale back to original
-                    r = dlib.rectangle(face.left()*2, face.top()*2, face.right()*2, face.bottom()*2)
-                    
-                    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    shape = PREDICTOR(gray_full, r)
-                    shape = face_utils.shape_to_np(shape)
-                    
-                    # EAR Calculation
-                    left_eye = shape[36:42]
-                    right_eye = shape[42:48]
-                    
-                    def eye_ear(pts):
-                        A = np.linalg.norm(pts[1]-pts[5])
-                        B = np.linalg.norm(pts[2]-pts[4])
-                        C = np.linalg.norm(pts[0]-pts[3])
-                        if C == 0:
-                            return 0.0
-                        return (A+B)/(2.0*C)
-                    
-                    cur_ear = (eye_ear(left_eye) + eye_ear(right_eye)) / 2.0
-                    
-                    # Blink filtering and time-based eye-closure detection
-                    # Frame-based blink filtering and state detection
-                    now = time.time()
-                    is_closed = cur_ear < ear_threshold
+        result = latest
 
-                    if is_closed:
-                        if closed_counter == 0:
-                            closure_start_time = now
-                        closed_counter += 1
-                    else:
-                        if 0 < closed_counter < DROWSY_FRAMES:
-                            st.session_state.blink_count += 1
-                            print(
-                                f"[EYE] Blink counted | closed_frames={closed_counter} "
-                                f"| blink_count={st.session_state.blink_count}"
-                            )
-                        closed_counter = 0
-                        closure_start_time = 0.0
-                        # Notify SOS state machine that driver is awake.
-                        # This cancels any active countdown automatically.
-                        _sos_notify_driver_active()
-                        st.session_state.sos_triggered = False
+    # ── Process detection result from transformer ─────────────────────────
+    if result is not None:
+        perf_tracker = ps["perf"]
+        perf_tracker.tick()
+        ps["f_idx"] += 1
 
-                    was_closed = is_closed
+        now = result["timestamp"]
+        closed_counter = ps["closed_counter"]
+        closure_start_time = ps["closure_start_time"]
+        last_sleep_detected_at = ps["last_sleep_detected_at"]
 
-                    # Frame-based states:
-                    # blink    -> below DROWSY_FRAMES, no alert
-                    # drowsy   -> >= DROWSY_FRAMES
-                    # sleeping -> >= SLEEP_FRAMES
-                    # sos      -> >= 6 seconds continuous closure
-                    if closure_start_time > 0 and (now - closure_start_time) >= 6.0:
-                        last_sleep_detected_at = now
-                        # Notify state machine; it handles countdown + SMS + cooldown
-                        if st.session_state.get("sos_auto_enabled", True):
-                            _sos_notify_severe_drowsiness(now)
-                        # Set status based on current SOS state
-                        _current_sos_state = _sos_get_state()
-                        if _current_sos_state == "COUNTDOWN":
-                            st.session_state.status = "SOS Countdown"
-                        elif _current_sos_state in ("TRIGGERED", "COOLDOWN"):
-                            st.session_state.status = "SOS Triggered"
-                        else:
-                            st.session_state.status = "Sleeping"
-                        if alarm_enabled:
-                            start_alert()
-                        else:
-                            print("[SOS] Alarm suppressed because alarm_enabled is False")
-                            stop_alert()
+        if result.get("face_detected"):
+            cur_ear = result["ear"]
+            is_closed = result["is_closed"]
 
-                    elif closed_counter >= SLEEP_FRAMES:
-                        last_sleep_detected_at = now
-                        st.session_state.status = "Sleeping"
-                        print(
-                            f"[ALARM] Sleeping detected | closed_frames={closed_counter} "
-                            f"| threshold={SLEEP_FRAMES} | alarm_enabled={alarm_enabled}"
-                        )
-                        if alarm_enabled:
-                            start_alert()
-                        else:
-                            print("[ALARM] Alarm suppressed because alarm_enabled is False")
-                            stop_alert()
-                    elif closed_counter >= DROWSY_FRAMES:
-                        st.session_state.status = "Drowsy"
-                        print(
-                            f"[ALARM] Drowsy detected | closed_frames={closed_counter} "
-                            f"| threshold={DROWSY_FRAMES}"
-                        )
-                        time_since_sleep = now - last_sleep_detected_at
-                        if time_since_sleep >= ALARM_RELEASE_SECONDS:
-                            print("[ALARM] Release hysteresis passed in drowsy state | stopping alarm")
-                            stop_alert()
-                        else:
-                            print(
-                                f"[ALARM] Holding alarm during drowsy fluctuation | "
-                                f"remaining={ALARM_RELEASE_SECONDS - time_since_sleep:.2f}s"
-                            )
-                    else:
-                        st.session_state.status = "Active"
-                        if closed_counter > 0:
-                            print(
-                                f"[ALARM] Eyes closed below drowsy threshold | "
-                                f"closed_frames={closed_counter}"
-                            )
-                        else:
-                            print("[ALARM] Active state detected")
-                        time_since_sleep = now - last_sleep_detected_at
-                        if time_since_sleep >= ALARM_RELEASE_SECONDS:
-                            print("[ALARM] Release hysteresis passed in active state | stopping alarm")
-                            stop_alert()
-                        else:
-                            print(
-                                f"[ALARM] Holding alarm during active fluctuation | "
-                                f"remaining={ALARM_RELEASE_SECONDS - time_since_sleep:.2f}s"
-                            )
-                    st.session_state.time_hist.append(time.time() - st.session_state.start_time)
-                    
-                    # Drawing
-                    if draw_box:
-                        c = (0,0,255) if is_closed else (16,185,129)
-                        cv2.rectangle(frame, (r.left(), r.top()), (r.right(), r.bottom()), c, 2)
-                    if draw_landmarks:
-                        for (x,y) in shape: cv2.circle(frame, (x,y), 1, (255,255,255), -1)
+            # ── Blink filtering and time-based eye-closure detection ──────
+            if is_closed:
+                if closed_counter == 0:
+                    closure_start_time = now
+                closed_counter += 1
+            else:
+                if 0 < closed_counter < DROWSY_FRAMES:
+                    st.session_state.blink_count += 1
+                    print(
+                        f"[EYE] Blink counted | closed_frames={closed_counter} "
+                        f"| blink_count={st.session_state.blink_count}"
+                    )
+                closed_counter = 0
+                closure_start_time = 0.0
+                # Notify SOS state machine that driver is awake.
+                # This cancels any active countdown automatically.
+                _sos_notify_driver_active()
+                st.session_state.sos_triggered = False
+
+            ps["was_closed"] = is_closed
+            ps["closed_counter"] = closed_counter
+            ps["closure_start_time"] = closure_start_time
+
+            # ── Drowsiness state machine (identical to original logic) ────
+            # Frame-based states:
+            #   blink    → below DROWSY_FRAMES, no alert
+            #   drowsy   → >= DROWSY_FRAMES
+            #   sleeping → >= SLEEP_FRAMES
+            #   sos      → >= 6 seconds continuous closure (time-based)
+            if closure_start_time > 0 and (now - closure_start_time) >= 6.0:
+                last_sleep_detected_at = now
+                # Notify state machine; it handles countdown + SMS + cooldown
+                if st.session_state.get("sos_auto_enabled", True):
+                    _sos_notify_severe_drowsiness(now)
+                # Set status based on current SOS state
+                _current_sos_state = _sos_get_state()
+                if _current_sos_state == "COUNTDOWN":
+                    st.session_state.status = "SOS Countdown"
+                elif _current_sos_state in ("TRIGGERED", "COOLDOWN"):
+                    st.session_state.status = "SOS Triggered"
                 else:
-                    st.session_state.status = "No Face"
-                    was_closed = False
-                    closed_counter = 0
-                    time_since_sleep = time.time() - last_sleep_detected_at
-                    if time_since_sleep >= ALARM_RELEASE_SECONDS:
-                        print("[ALARM] No face detected and hysteresis passed | stopping alarm")
-                        stop_alert()
-                    else:
-                        print(
-                            f"[ALARM] No face fluctuation | keeping alarm alive for "
-                            f"{ALARM_RELEASE_SECONDS - time_since_sleep:.2f}s"
-                        )
+                    st.session_state.status = "Sleeping"
+                if alarm_enabled:
+                    start_alert()
+                else:
+                    print("[SOS] Alarm suppressed because alarm_enabled is False")
+                    stop_alert()
 
-            # ── Live debug counter update in sidebar ──────────────────────
-            # Safe read: ear_hist may be empty on startup frames before any
-            # face has been detected, so always guard with a fallback.
-            _ear_display = f"{st.session_state.ear_hist[-1]:.3f}" if st.session_state.ear_hist else "--"
-            _closed_display = str(closed_counter) if closed_counter > 0 else "--"
-            alarm = _get_alarm()
-            alert_state = "PLAYING" if alarm.is_playing() else "OFF"
-            _dbg_sos_state = _sos_get_state()
-            _dbg_countdown = _sos_get_countdown_remaining(time.time())
-            _dbg_countdown_str = f"{_dbg_countdown:.1f}s" if _dbg_sos_state == "COUNTDOWN" else "--"
-            debug_placeholder.markdown(
-                f"""
-                | Counter | Value |
-                |---|---|
-                | `closed_frames` | **{_closed_display}** |
-                | `sleep_after` | **{SLEEP_FRAMES} frames** |
-                | `sos_after` | **{SOS_FRAMES} frames** |
-                | `drowsy_after` | **{DROWSY_FRAMES} frames** |
-                | `EAR` | **{_ear_display}** |
-                | `SOS State` | **{_dbg_sos_state}** |
-                | `Countdown` | **{_dbg_countdown_str}** |
-                | `Alarm` | {alert_state} |
-                """,
-                unsafe_allow_html=False
+            elif closed_counter >= SLEEP_FRAMES:
+                last_sleep_detected_at = now
+                st.session_state.status = "Sleeping"
+                print(
+                    f"[ALARM] Sleeping detected | closed_frames={closed_counter} "
+                    f"| threshold={SLEEP_FRAMES} | alarm_enabled={alarm_enabled}"
+                )
+                if alarm_enabled:
+                    start_alert()
+                else:
+                    print("[ALARM] Alarm suppressed because alarm_enabled is False")
+                    stop_alert()
+            elif closed_counter >= DROWSY_FRAMES:
+                st.session_state.status = "Drowsy"
+                print(
+                    f"[ALARM] Drowsy detected | closed_frames={closed_counter} "
+                    f"| threshold={DROWSY_FRAMES}"
+                )
+                time_since_sleep = now - last_sleep_detected_at
+                if time_since_sleep >= ALARM_RELEASE_SECONDS:
+                    print("[ALARM] Release hysteresis passed in drowsy state | stopping alarm")
+                    stop_alert()
+                else:
+                    print(
+                        f"[ALARM] Holding alarm during drowsy fluctuation | "
+                        f"remaining={ALARM_RELEASE_SECONDS - time_since_sleep:.2f}s"
+                    )
+            else:
+                st.session_state.status = "Active"
+                if closed_counter > 0:
+                    print(
+                        f"[ALARM] Eyes closed below drowsy threshold | "
+                        f"closed_frames={closed_counter}"
+                    )
+                else:
+                    print("[ALARM] Active state detected")
+                time_since_sleep = now - last_sleep_detected_at
+                if time_since_sleep >= ALARM_RELEASE_SECONDS:
+                    print("[ALARM] Release hysteresis passed in active state | stopping alarm")
+                    stop_alert()
+                else:
+                    print(
+                        f"[ALARM] Holding alarm during active fluctuation | "
+                        f"remaining={ALARM_RELEASE_SECONDS - time_since_sleep:.2f}s"
+                    )
 
+            ps["last_sleep_detected_at"] = last_sleep_detected_at
+            st.session_state.ear_hist.append(cur_ear)
+            st.session_state.time_hist.append(now - st.session_state.start_time)
+
+        else:
+            # No face detected
+            st.session_state.status = "No Face"
+            ps["was_closed"] = False
+            ps["closed_counter"] = 0
+            time_since_sleep = now - ps["last_sleep_detected_at"]
+            if time_since_sleep >= ALARM_RELEASE_SECONDS:
+                print("[ALARM] No face detected and hysteresis passed | stopping alarm")
+                stop_alert()
+            else:
+                print(
+                    f"[ALARM] No face fluctuation | keeping alarm alive for "
+                    f"{ALARM_RELEASE_SECONDS - time_since_sleep:.2f}s"
+                )
+
+    # ── Live debug counter update in sidebar ─────────────────────────────
+    # Safe read: ear_hist may be empty on startup frames before any face
+    # has been detected, so always guard with a fallback.
+    closed_counter = ps.get("closed_counter", 0)
+    _ear_display = f"{st.session_state.ear_hist[-1]:.3f}" if st.session_state.ear_hist else "--"
+    _closed_display = str(closed_counter) if closed_counter > 0 else "--"
+    alert_state = "PLAYING" if st.session_state.get("alarm_active", False) else "OFF"
+    _dbg_sos_state = _sos_get_state()
+    _dbg_countdown = _sos_get_countdown_remaining(time.time())
+    _dbg_countdown_str = f"{_dbg_countdown:.1f}s" if _dbg_sos_state == "COUNTDOWN" else "--"
+    debug_placeholder.markdown(
+        f"""
+        | Counter | Value |
+        |---|---|
+        | `closed_frames` | **{_closed_display}** |
+        | `sleep_after` | **{SLEEP_FRAMES} frames** |
+        | `sos_after` | **{SOS_FRAMES} frames** |
+        | `drowsy_after` | **{DROWSY_FRAMES} frames** |
+        | `EAR` | **{_ear_display}** |
+        | `SOS State` | **{_dbg_sos_state}** |
+        | `Countdown` | **{_dbg_countdown_str}** |
+        | `Alarm` | {alert_state} |
+        """,
+        unsafe_allow_html=False,
+    )
+
+    # ── UI update ─────────────────────────────────────────────────────────
+    st_text = st.session_state.status
+    s_pill = st_text.lower().replace(" ", "-")
+    status_placeholder.markdown(
+        f"<div class='status-pill status-{s_pill}'>{st_text}</div>",
+        unsafe_allow_html=True,
+    )
+
+    perf_obj = ps["perf"]
+    fps_placeholder.markdown(
+        f"""
+        <div class='micro-card hero-stat'>
+            <div>
+                <div class='metric-label'>System Performance</div>
+                <div class='fps-badge'>{perf_obj.get_fps():.1f} FPS</div>
+                <div class='metric-note'>Realtime processing throughput</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    elap = int(time.time() - st.session_state.start_time)
+    time_placeholder.markdown(
+        f"""
+        <div class='micro-card hero-stat'>
+            <div>
+                <div class='metric-label'>Elapsed Time</div>
+                <div class='metric-value metric-small'>{elap//60:02d}:{elap%60:02d}s</div>
+                <div class='metric-note'>Session runtime</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    ear_now = st.session_state.ear_hist[-1] if st.session_state.ear_hist else 0.0
+    fatigue = min(
+        100,
+        max(
+            0,
+            (ear_threshold - ear_now) / ear_threshold * 40
+            + min(60, closed_counter * 2),
+        ),
+    )
+    f_color = "#ef4444" if fatigue > 70 else ("#fbbf24" if fatigue > 35 else "#10b981")
+    fatigue_placeholder.markdown(
+        f"""
+        <div class='metric-value' style='color:{f_color};'>{fatigue:.1f}%</div>
+        <div class='metric-note'>Risk escalates with sustained eye closure and reduced EAR.</div>
+        <div class='fatigue-track'>
+            <div class='fatigue-fill' style='width:{fatigue}%; background:{f_color}; color:{f_color};'></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    blink_placeholder.markdown(
+        f"<div class='metric-value'>{st.session_state.blink_count}</div>",
+        unsafe_allow_html=True,
+    )
+    ear_placeholder.markdown(
+        f"<div class='metric-value'>{ear_now:.3f}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Alert / Countdown Banner ──────────────────────────────────────────
+    _now_ts = time.time()
+
+    if st_text == "SOS Countdown":
+        _secs_left = _sos_get_countdown_remaining(_now_ts)
+        alert_placeholder.markdown(
+            f"""<div class='countdown-banner'>
+                🚨 WARNING — SEVERE DROWSINESS DETECTED<br>
+                <span style='font-size:1.6rem; font-weight:900;'>
+                    SOS IN {int(_secs_left) + 1} SECOND{'S' if int(_secs_left) + 1 != 1 else ''}
+                </span><br>
+                <span style='font-size:0.82rem; opacity:0.85; letter-spacing:0.06em;'>
+                    Press <b>CANCEL SOS</b> in the sidebar to abort
+                </span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    elif st_text == "SOS Triggered":
+        _sent_ts = st.session_state.get("sos_last_sent_time", "")
+        _sent_label = f"Alert sent at {_sent_ts}" if _sent_ts else "Emergency alert sent"
+        alert_placeholder.markdown(
+            f"""<div class='sos-sent-banner'>
+                🚨 SOS TRIGGERED • DRIVER UNRESPONSIVE • EMERGENCY ALERT ACTIVE<br>
+                <span style='font-size:0.82rem; opacity:0.8;'>{_sent_label}</span>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    elif st_text == "Sleeping":
+        alert_placeholder.markdown(
+            "<div class='alert-bar'>WAKE UP DRIVER • EYES CLOSED DETECTED</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        alert_placeholder.empty()
+
+    # ── Analytics Graph (every 10 processing results) ────────────────────
+    f_idx = ps.get("f_idx", 0)
+    if live_graph_active and PLOTLY_AVAILABLE and f_idx % 10 == 0:
+        if len(st.session_state.ear_hist) > 5:
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=list(st.session_state.time_hist),
+                    y=list(st.session_state.ear_hist),
+                    mode="lines",
+                    line=dict(color="#6ee7f9", width=3),
+                    fill="tozeroy",
+                    fillcolor="rgba(110,231,249,0.12)",
+                )
             )
-            # UI Update Throttling (~15 FPS)
-            if time.time() - last_ui > 0.06:
-                # Video
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                video_placeholder.image(rgb, channels="RGB", use_container_width=True)
+            fig.update_layout(
+                height=180,
+                margin=dict(l=0, r=0, t=0, b=0),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                yaxis=dict(
+                    range=[0.1, 0.4],
+                    showgrid=True,
+                    gridcolor="rgba(148,163,184,0.12)",
+                    tickfont=dict(color="#8fa6c2"),
+                    zeroline=False,
+                ),
+                showlegend=False,
+            )
+            graph_placeholder.empty()
+            graph_placeholder.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"ear_analytics_{f_idx}",
+            )
 
-                # Logic Stats
-                st_text = st.session_state.status
-                s_pill = st_text.lower().replace(" ", "-")
-                status_placeholder.markdown(
-                    f"<div class='status-pill status-{s_pill}'>{st_text}</div>",
-                    unsafe_allow_html=True,
-                )
-
-                fps_placeholder.markdown(
-                    f"""
-                    <div class='micro-card hero-stat'>
-                        <div>
-                            <div class='metric-label'>System Performance</div>
-                            <div class='fps-badge'>{perf.get_fps():.1f} FPS</div>
-                            <div class='metric-note'>Realtime processing throughput</div>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                elap = int(time.time() - st.session_state.start_time)
-                time_placeholder.markdown(
-                    f"""
-                    <div class='micro-card hero-stat'>
-                        <div>
-                            <div class='metric-label'>Elapsed Time</div>
-                            <div class='metric-value metric-small'>{elap//60:02d}:{elap%60:02d}s</div>
-                            <div class='metric-note'>Session runtime</div>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                # Fatigue
-                ear_now = st.session_state.ear_hist[-1] if st.session_state.ear_hist else 0.0
-                fatigue = min(
-                    100,
-                    max(
-                        0,
-                        (ear_threshold-ear_now)/ear_threshold*40
-                        + min(60, closed_counter * 2)
-                    )
-                )
-                f_color = "#ef4444" if fatigue > 70 else ("#fbbf24" if fatigue > 35 else "#10b981")
-                fatigue_placeholder.markdown(
-                    f"""
-                    <div class='metric-value' style='color:{f_color};'>{fatigue:.1f}%</div>
-                    <div class='metric-note'>Risk escalates with sustained eye closure and reduced EAR.</div>
-                    <div class='fatigue-track'>
-                        <div class='fatigue-fill' style='width:{fatigue}%; background:{f_color}; color:{f_color};'></div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-
-                blink_placeholder.markdown(
-                    f"<div class='metric-value'>{st.session_state.blink_count}</div>",
-                    unsafe_allow_html=True,
-                )
-                ear_placeholder.markdown(
-                    f"<div class='metric-value'>{ear_now:.3f}</div>",
-                    unsafe_allow_html=True,
-                )
-
-                # ── Alert / Countdown Banner ──────────────────────────────
-                _sos_state_now = _sos_get_state()
-                _now_ts = time.time()
-
-                if st_text == "SOS Countdown":
-                    _secs_left = _sos_get_countdown_remaining(_now_ts)
-                    alert_placeholder.markdown(
-                        f"""<div class='countdown-banner'>
-                            🚨 WARNING — SEVERE DROWSINESS DETECTED<br>
-                            <span style='font-size:1.6rem; font-weight:900;'>
-                                SOS IN {int(_secs_left) + 1} SECOND{'S' if int(_secs_left) + 1 != 1 else ''}
-                            </span><br>
-                            <span style='font-size:0.82rem; opacity:0.85; letter-spacing:0.06em;'>
-                                Press <b>CANCEL SOS</b> in the sidebar to abort
-                            </span>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                elif st_text == "SOS Triggered":
-                    _sent_ts = st.session_state.get("sos_last_sent_time", "")
-                    _sent_label = f"Alert sent at {_sent_ts}" if _sent_ts else "Emergency alert sent"
-                    alert_placeholder.markdown(
-                        f"""<div class='sos-sent-banner'>
-                            🚨 SOS TRIGGERED • DRIVER UNRESPONSIVE • EMERGENCY ALERT ACTIVE<br>
-                            <span style='font-size:0.82rem; opacity:0.8;'>{_sent_label}</span>
-                        </div>""",
-                        unsafe_allow_html=True,
-                    )
-                elif st_text == "Sleeping":
-                    alert_placeholder.markdown(
-                        "<div class='alert-bar'>WAKE UP DRIVER • EYES CLOSED DETECTED</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    alert_placeholder.empty()
-
-                # Analytics Graph Refresh (Throttled to every 10 frames)
-                if live_graph_active and PLOTLY_AVAILABLE and f_idx % 10 == 0:
-                    if len(st.session_state.ear_hist) > 5:
-                        fig = go.Figure()
-                        fig.add_trace(
-                            go.Scatter(
-                                x=list(st.session_state.time_hist),
-                                y=list(st.session_state.ear_hist),
-                                mode='lines',
-                                line=dict(color='#6ee7f9', width=3),
-                                fill='tozeroy',
-                                fillcolor='rgba(110,231,249,0.12)',
-                            )
-                        )
-                        fig.update_layout(
-                            height=180,
-                            margin=dict(l=0, r=0, t=0, b=0),
-                            paper_bgcolor='rgba(0,0,0,0)',
-                            plot_bgcolor='rgba(0,0,0,0)',
-                            xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
-                            yaxis=dict(
-                                range=[0.1, 0.4],
-                                showgrid=True,
-                                gridcolor='rgba(148,163,184,0.12)',
-                                tickfont=dict(color='#8fa6c2'),
-                                zeroline=False,
-                            ),
-                            showlegend=False,
-                        )
-
-                        graph_placeholder.empty()
-                        graph_placeholder.plotly_chart(
-                            fig,
-                            use_container_width=True,
-                            config={'displayModeBar': False},
-                            key=f"ear_analytics_{f_idx}"
-                        )
-
-                last_ui = time.time()
+    # ── Rerun to keep processing browser webcam frames ───────────────────
+    # The WebRTC video stream is independent and always runs at camera FPS.
+    # This rerun only updates metrics/banners at ~20 FPS.
+    time.sleep(0.05)
+    st.rerun()
 
 else:
-    # Standby UI
+    # ── Standby UI (monitoring off or models unavailable) ────────────────
+    stop_alert()  # Ensure alarm stops when monitoring is disabled
+    if "proc_state" in st.session_state:
+        st.session_state.proc_state = None
+
     video_placeholder.markdown("""
         <div style='background: #0b1120; border: 2px dashed #1e293b; border-radius: 16px; height: 360px; display: flex; align-items: center; justify-content: center; flex-direction: column;'>
             <div style='font-size: 3.5rem; filter: grayscale(1);'>📸</div>
@@ -1989,3 +2046,7 @@ else:
 
 if DETECTOR is None:
     st.error("Model files not found. Upload 'shape_predictor_68_face_landmarks.dat'.", icon="❌")
+
+# Render the HTML5 browser alarm audio if active
+render_browser_alarm()
+
