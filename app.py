@@ -24,12 +24,8 @@ try:
     from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
     import av
     WEBRTC_AVAILABLE = True
-    _RTC_CONFIGURATION = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
 except ImportError:
     WEBRTC_AVAILABLE = False
-    _RTC_CONFIGURATION = None
 
 # ── Dependency Check ──────────────────────────────────────────────────────────
 try:
@@ -60,6 +56,35 @@ try:
     print("[Config] .env file loaded (if present)")
 except ImportError:
     print("[Config] python-dotenv not installed; run: pip install python-dotenv")
+
+@st.cache_resource(show_spinner=False)
+def _get_rtc_configuration():
+    if not WEBRTC_AVAILABLE:
+        return None
+
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+
+    if account_sid and auth_token:
+        try:
+            from twilio.rest import Client
+            client = Client(account_sid, auth_token)
+            token = client.tokens.create(ttl=3600)
+            
+            return RTCConfiguration({
+                "iceServers": token.ice_servers
+            })
+        except Exception as exc:
+            print(f"[WebRTC] Failed to obtain Twilio NTS credentials: {exc}")
+
+    # Safe fallback
+    return RTCConfiguration({
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]}
+        ]
+    })
+
+_RTC_CONFIGURATION = _get_rtc_configuration()
 
 # ── SOS module imports ────────────────────────────────────────────────────
 try:
