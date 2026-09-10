@@ -1187,14 +1187,74 @@ def stop_alert():
         st.session_state.alarm_active = False
 
 def render_browser_alarm():
-    """Injects an invisible HTML5 audio element into the DOM if the alarm is active."""
-    if st.session_state.get("alarm_active", False):
-        b64 = _get_alarm_base64()
-        if b64:
-            st.markdown(
-                f'<audio autoplay loop style="display:none;"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>',
-                unsafe_allow_html=True,
-            )
+    """Inject a persistent JS-controlled HTML5 audio player via st.components.v1.html.
+
+    Why st.components.v1.html instead of st.markdown:
+      1. st.markdown <audio autoplay> is blocked by browser autoplay policy.
+      2. st.markdown cannot execute <script> tags reliably.
+      3. st.markdown elements are destroyed and recreated on every Streamlit rerun,
+         so audio never plays for more than a fraction of a second.
+
+    st.components.v1.html runs inside an iframe where JavaScript executes reliably.
+    Each rerun re-renders the component with the current desired state (play/stop),
+    and the JS inside immediately acts on it.
+    """
+    import streamlit.components.v1 as components
+
+    is_active = st.session_state.get("alarm_active", False)
+    b64 = _get_alarm_base64()
+    if not b64:
+        return
+
+    # The JS inside the iframe will play or pause based on the "shouldPlay" flag.
+    # We embed the entire MP3 as a data-URI so there are no path/serving issues.
+    should_play_js = "true" if is_active else "false"
+
+    html_code = f"""
+    <script>
+    (function() {{
+        var shouldPlay = {should_play_js};
+        var audioId = "drowsiness_alarm_audio";
+        var audio = document.getElementById(audioId);
+        if (!audio) {{
+            audio = document.createElement("audio");
+            audio.id = audioId;
+            audio.loop = true;
+            audio.preload = "auto";
+            audio.src = "data:audio/mpeg;base64,{b64}";
+            document.body.appendChild(audio);
+        }}
+        if (shouldPlay) {{
+            // Attempt to play — catches NotAllowedError gracefully
+            var p = audio.play();
+            if (p && typeof p.catch === "function") {{
+                p.catch(function(err) {{
+                    console.warn("[DrowsinessAlarm] play() blocked:", err.message);
+                    // Fallback: use Web Audio API oscillator beep as audible alert
+                    try {{
+                        var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                        var osc = ctx.createOscillator();
+                        var gain = ctx.createGain();
+                        osc.type = "square";
+                        osc.frequency.value = 800;
+                        gain.gain.value = 0.3;
+                        osc.connect(gain);
+                        gain.connect(ctx.destination);
+                        osc.start();
+                        setTimeout(function() {{ osc.stop(); ctx.close(); }}, 1500);
+                    }} catch(e2) {{
+                        console.warn("[DrowsinessAlarm] oscillator fallback failed:", e2);
+                    }}
+                }});
+            }}
+        }} else {{
+            audio.pause();
+            audio.currentTime = 0;
+        }}
+    }})();
+    </script>
+    """
+    components.html(html_code, height=0, width=0)
 
 @st.cache_resource(show_spinner=False)
 def load_models():
